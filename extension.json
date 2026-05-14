@@ -1,0 +1,10 @@
+{
+  "name": "aergia",
+  "description": "Extensão aergia para o pyRevit.",
+  "author": "Guilherme",
+  "author_profile": "",
+  "url": "",
+  "repository": "",
+  "type": "extension",
+  "dependencies": []
+}
