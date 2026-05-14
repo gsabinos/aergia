@@ -1,0 +1,13 @@
+title:
+  en_us: Poles to Topo
+  pt_br: Postes na Topo
+tooltip:
+  en_us: |
+    Drop family instances vertically to a native Revit Toposolid
+    or TopographySurface. Run "Topo from CAD" first if you don't
+    have a topography in the project yet.
+  pt_br: |
+    Desce famílias colocadas verticalmente até uma Toposolid ou
+    TopographySurface nativa do Revit. Use "Topo do CAD" primeiro
+    se ainda não tiver topografia no projeto.
+author: "{{author}}"
