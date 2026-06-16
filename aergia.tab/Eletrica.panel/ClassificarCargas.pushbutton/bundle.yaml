@@ -1,0 +1,21 @@
+title:
+  en_us: |-
+    Classify
+    Loads
+  pt_br: |-
+    Classificar
+    Cargas
+tooltip:
+  en_us: |
+    Select nested family instances and click a load classification: it reads the
+    integer 'pos' from each selected item, walks up via SuperComponent to the host
+    family and fills zpat{pos} (power), zFP{pos} (power factor) and
+    "zTipo de Carga {pos}" (native Load Classification, created if missing).
+    Classifications and their NBR values are editable in the "Configurar" tab.
+  pt_br: |
+    Selecione famílias aninhadas e clique numa classificação de carga: o comando lê
+    o inteiro 'pos' de cada item selecionado, sobe via SuperComponent até a família
+    pai e preenche zpat{pos} (potência), zFP{pos} (fator de potência) e
+    "zTipo de Carga {pos}" (Load Classification nativa, criada se não existir).
+    As classificações e os valores NBR são editáveis na aba "Configurar".
+author: "{{author}}"

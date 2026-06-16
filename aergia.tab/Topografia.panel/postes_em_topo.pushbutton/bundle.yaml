@@ -3,11 +3,21 @@ title:
   pt_br: Postes na Topo
 tooltip:
   en_us: |
-    Drop family instances vertically to a native Revit Toposolid
-    or TopographySurface. Run "Topo from CAD" first if you don't
-    have a topography in the project yet.
+    Drop family instances vertically onto any native Revit topography
+    (Toposolid or TopographySurface), in the model OR in a linked file.
+    Pre-select poles (drag/Ctrl) before running, or pick them one by one;
+    Shift+click = all instances of that type. Picked poles are highlighted
+    orange while selecting (cleared when done). ESC finishes. No dialog on
+    success. Shift+click THIS button = tabbed window: configure a terrain
+    link (whole content treated as terrain, saved globally) AND the "Poles
+    to NWC" round-trip (Export / Apply Z / Apply Transform).
   pt_br: |
-    Desce famílias colocadas verticalmente até uma Toposolid ou
-    TopographySurface nativa do Revit. Use "Topo do CAD" primeiro
-    se ainda não tiver topografia no projeto.
+    Desce famílias verticalmente até qualquer topografia nativa do Revit
+    (Toposolid ou TopographySurface), no modelo OU em link. Pré-selecione
+    os postes (arraste/Ctrl) antes, ou clique um a um; Shift+clique = todas
+    as instâncias daquele tipo. Os postes selecionados ficam laranja durante
+    a seleção (limpo ao concluir). ESC finaliza. Sem caixa ao concluir.
+    Shift+clique NESTE botão = janela com abas: configurar link-terreno
+    (conteúdo inteiro vira terreno, salvo global) E o round-trip "Postes
+    para NWC" (Exportar / Aplicar Z / Aplicar Transform).
 author: "{{author}}"

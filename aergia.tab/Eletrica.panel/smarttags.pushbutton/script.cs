@@ -46,6 +46,18 @@ namespace Aegia_Automations
         public string GetName() => "Aegia Salvar Configuracoes Handler";
     }
 
+    // Handler para o botão "Atualizar Tags" do formulário modeless: precisa de contexto Revit válido.
+    public class AtualizarTagsHandler : IExternalEventHandler
+    {
+        public void Execute(UIApplication app)
+        {
+            Document doc = app.ActiveUIDocument?.Document;
+            if (doc != null) new SmartTagsCommand().ExecutarAtualizarTags(doc);
+        }
+
+        public string GetName() => "Aegia Atualizar Tags Handler";
+    }
+
     [Transaction(TransactionMode.Manual)]
     public class SmartTagsCommand : IExternalCommand
     {
@@ -396,80 +408,117 @@ namespace Aegia_Automations
         }
 
         // ==========================================================================================
-        // MODO: SET CHAM (ATUALIZAR TAGS EM VISTA DE DESENHO)
+        // MODO: ATUALIZAR TAGS (PROJETO INTEIRO, VIA ÂNCORAS CIRCID/ELID)
         // ==========================================================================================
-        private Result ExecutarSetCham(UIDocument uidoc, Document doc, ViewDrafting draftingView)
+        // Relê a identidade VIVA das anotações e reescreve seu conteúdo, mantendo posições.
+        // - Tag de circuito (tem CIRCID): relê número/tipo/bitola do circuito e fiação do ZFIACAO do conduto.
+        // - Tag de chamada (só ELID): atualiza tam/mk/el do conduto (comportamento legado).
+        public Result ExecutarAtualizarTags(Document doc)
         {
-            var annotations = new FilteredElementCollector(doc, draftingView.Id)
+            var annotations = new FilteredElementCollector(doc)
                 .OfCategory(BuiltInCategory.OST_GenericAnnotation)
                 .WhereElementIsNotElementType()
                 .Cast<FamilyInstance>()
                 .ToList();
 
-            using (Transaction t = new Transaction(doc, "Set Cham"))
+            int circuitos = 0, chamadas = 0, orfas = 0;
+
+            using (Transaction t = new Transaction(doc, "Atualizar Tags Aegia"))
             {
                 t.Start();
-                int count = 0;
 
                 foreach (var anno in annotations)
                 {
                     if (anno == null || !anno.IsValidObject || anno.Category == null) continue;
 
-                    Parameter pElid = anno.LookupParameter("ELID");
-                    if (pElid == null || string.IsNullOrWhiteSpace(pElid.AsString())) continue;
+                    Parameter pCirc = anno.LookupParameter("CIRCID");
+                    string circIdStr = pCirc?.AsString();
 
-                    string elidStr = pElid.AsString();
-                    if (!long.TryParse(elidStr, out long idVal)) continue;
-
-                    ElementId elemId = new ElementId(idVal);
-                    Element elem = doc.GetElement(elemId);
-
-                    if (elem == null || !elem.IsValidObject || elem.Category == null) continue;
-
-                    try
+                    if (!string.IsNullOrWhiteSpace(circIdStr))
                     {
-                        string valA = GetParamStringOrValueCustom(elem, "ZZ.ELNIV");
-                        string valB = GetParamStringOrValue(elem, BuiltInParameter.RBS_OFFSET_PARAM);
-                        if (string.IsNullOrEmpty(valB)) valB = GetParamStringOrValueCustom(elem, "Bottom Elevation");
-                        if (string.IsNullOrEmpty(valB)) valB = GetParamStringOrValueCustom(elem, "Elevação inferior");
-                        string elevacao = (valA + valB).Trim();
+                        // --- Tag de circuito (âncora estável CIRCID) ---
+                        if (!long.TryParse(circIdStr, out long cidVal)) continue;
+                        Element circ = doc.GetElement(new ElementId(cidVal));
+                        if (circ == null || !circ.IsValidObject) { orfas++; continue; }
 
-                        string mark = GetParamStringOrValue(elem, BuiltInParameter.ALL_MODEL_MARK);
-
-                        string size = GetParamStringOrValue(elem, BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM);
-                        if (string.IsNullOrEmpty(size)) size = GetParamStringOrValueCustom(elem, "Tamanho");
-
-                        if (!string.IsNullOrEmpty(size))
+                        try
                         {
-                            size = size.Replace("ø", "").Replace("Ø", "").Trim();
-                            if (elem.Category.Id.Value == (long)BuiltInCategory.OST_Conduit)
+                            string numCirc = GetParamStringOrValue(circ, BuiltInParameter.RBS_ELEC_CIRCUIT_NUMBER);
+                            if (string.IsNullOrEmpty(numCirc)) numCirc = "S/N";
+                            string tipoCirc = GetParamStringOrValueCustom(circ, "Tipo Circuito");
+
+                            bool isTomIlu = tipoCirc.ToUpper().Contains("TOM") || tipoCirc.ToUpper().Contains("ILU");
+                            var dadosFio = (0, 0, 0, 0, "");
+                            double bitola = 0.0;
+
+                            // Fiação e SWID vêm do conduto referenciado por ELID.
+                            string elidStr = anno.LookupParameter("ELID")?.AsString();
+                            if (long.TryParse(elidStr, out long condVal))
                             {
-                                size = "Ø" + size;
+                                Element conduto = doc.GetElement(new ElementId(condVal));
+                                if (conduto != null && conduto.IsValidObject)
+                                {
+                                    if (isTomIlu)
+                                    {
+                                        var mapaFios = ParseFiacao(GetParamStringOrValueCustom(conduto, "ZFIACAO"));
+                                        dadosFio = ExtrairDadosFio(mapaFios.ContainsKey(numCirc) ? mapaFios[numCirc] : "");
+                                        bitola = ObterBitola(circ);
+                                    }
+
+                                    var zidsMap = ParseZids(GetParamStringOrValueCustom(conduto, "ZIDS"));
+                                    SetParamRobusto(anno, new[] { "SWID" }, zidsMap.ContainsKey(circIdStr) ? string.Join(",", zidsMap[circIdStr]) : "");
+                                }
                             }
+
+                            PreencherViaLog(anno, new CircuitoLog { Numero = numCirc, TipoCircuito = tipoCirc, F = dadosFio.Item1, N = dadosFio.Item2, T = dadosFio.Item3, R = dadosFio.Item4, TextoRet = dadosFio.Item5, Bitola = bitola });
+                            circuitos++;
                         }
-
-                        SetParamRobusto(anno, new[] { "tam" }, size ?? "");
-                        SetParamRobusto(anno, new[] { "mk" }, mark ?? "");
-                        SetParamRobusto(anno, new[] { "el" }, elevacao ?? "");
-
-                        count++;
+                        catch { }
                     }
-                    catch { }
+                    else
+                    {
+                        // --- Tag de chamada (só ELID, comportamento legado) ---
+                        string elidStr = anno.LookupParameter("ELID")?.AsString();
+                        if (string.IsNullOrWhiteSpace(elidStr) || !long.TryParse(elidStr, out long idVal)) continue;
+                        Element elem = doc.GetElement(new ElementId(idVal));
+                        if (elem == null || !elem.IsValidObject || elem.Category == null) { orfas++; continue; }
+                        try { AtualizarChamada(anno, elem); chamadas++; } catch { }
+                    }
                 }
 
                 t.Commit();
-                
-                if (count > 0)
-                {
-                    Autodesk.Revit.UI.TaskDialog.Show("Aegia | SmartTags", $"Sincronização de Tags concluída com sucesso!\n{count} anotações foram atualizadas com os dados do modelo.");
-                }
-                else
-                {
-                    Autodesk.Revit.UI.TaskDialog.Show("Aegia | SmartTags", "Nenhuma anotação com o parâmetro 'ELID' válido foi encontrada nesta vista.");
-                }
             }
 
+            Autodesk.Revit.UI.TaskDialog.Show("Aegia | SmartTags",
+                $"Atualização concluída.\n\nTags de circuito atualizadas: {circuitos}\nChamadas atualizadas: {chamadas}\nÓrfãs (circuito/elemento ausente): {orfas}");
+
             return Result.Succeeded;
+        }
+
+        // Atualiza tam/mk/el de uma tag de chamada a partir do conduto/elemento referenciado.
+        private void AtualizarChamada(FamilyInstance anno, Element elem)
+        {
+            string valA = GetParamStringOrValueCustom(elem, "ZZ.ELNIV");
+            string valB = GetParamStringOrValue(elem, BuiltInParameter.RBS_OFFSET_PARAM);
+            if (string.IsNullOrEmpty(valB)) valB = GetParamStringOrValueCustom(elem, "Bottom Elevation");
+            if (string.IsNullOrEmpty(valB)) valB = GetParamStringOrValueCustom(elem, "Elevação inferior");
+            string elevacao = (valA + valB).Trim();
+
+            string mark = GetParamStringOrValue(elem, BuiltInParameter.ALL_MODEL_MARK);
+
+            string size = GetParamStringOrValue(elem, BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM);
+            if (string.IsNullOrEmpty(size)) size = GetParamStringOrValueCustom(elem, "Tamanho");
+
+            if (!string.IsNullOrEmpty(size))
+            {
+                size = size.Replace("ø", "").Replace("Ø", "").Trim();
+                if (elem.Category != null && elem.Category.Id.Value == (long)BuiltInCategory.OST_Conduit)
+                    size = "Ø" + size;
+            }
+
+            SetParamRobusto(anno, new[] { "tam" }, size ?? "");
+            SetParamRobusto(anno, new[] { "mk" }, mark ?? "");
+            SetParamRobusto(anno, new[] { "el" }, elevacao ?? "");
         }
 
         private string GetParamStringOrValue(Element elem, BuiltInParameter paramId)
@@ -581,7 +630,8 @@ namespace Aegia_Automations
                     string zids = GetParamStringOrValueCustom(conduit, "ZIDS");
                     string zfiacao = GetParamStringOrValueCustom(conduit, "ZFIACAO");
 
-                    var idsCircs = ExtractNumbers(zids);
+                    var zidsMap = ParseZids(zids);            // cid -> lista de switchIds
+                    var idsCircs = zidsMap.Keys.ToList();
                     var mapaFios = ParseFiacao(zfiacao);
 
                     XYZ rightDir = activeView.RightDirection;
@@ -753,7 +803,10 @@ namespace Aegia_Automations
                                 var dFio = isTomIlu ? ExtrairDadosFio(mapaFios.ContainsKey(numCirc) ? mapaFios[numCirc] : "") : (0, 0, 0, 0, "");
                                 double bitola = isTomIlu ? ObterBitola(circ) : 0.0;
 
-                                string linhaLog = $"{timeStamp} | ID_Vista: {activeView.Id} | ID_Conduto: {conduit.Id} | ID_Tag: {tagIdStr} | Circuito: {numCirc} ({tipoCirc}) | F:{dFio.Item1} N:{dFio.Item2} T:{dFio.Item3} R:{dFio.Item4} Ret:[{dFio.Item5}] | Bitola:{bitola.ToString(CultureInfo.InvariantCulture)}";
+                                // ID_Circ e SWID são acrescentados ao FINAL (parts[7], parts[8]) para não deslocar
+                                // os índices que os parsers de memória já esperam (parts[0..6]).
+                                string swidLog = zidsMap.ContainsKey(kvp.Key.ToString()) ? string.Join(",", zidsMap[kvp.Key.ToString()]) : "";
+                                string linhaLog = $"{timeStamp} | ID_Vista: {activeView.Id} | ID_Conduto: {conduit.Id} | ID_Tag: {tagIdStr} | Circuito: {numCirc} ({tipoCirc}) | F:{dFio.Item1} N:{dFio.Item2} T:{dFio.Item3} R:{dFio.Item4} Ret:[{dFio.Item5}] | Bitola:{bitola.ToString(CultureInfo.InvariantCulture)} | ID_Circ: {kvp.Key} | SWID: {swidLog}";
                                 logLines.Add(linhaLog);
                             }
 
@@ -808,6 +861,12 @@ namespace Aegia_Automations
 
                                 FamilyInstance inst = doc.Create.NewFamilyInstance(cursor3D, sym, activeView);
                                 PreencherViaLog(inst, new CircuitoLog { Numero = numCirc, TipoCircuito = tipoCirc, F = dadosFio.Item1, N = dadosFio.Item2, T = dadosFio.Item3, R = dadosFio.Item4, TextoRet = dadosFio.Item5, Bitola = bitola });
+
+                                // Âncoras estáveis para o modo "Atualizar": id do conduto, id do circuito e id(s) do(s) comando(s).
+                                string cidAnc = tupla.Item4;
+                                SetParamRobusto(inst, new[] { "ELID" }, conduit.Id.ToString());
+                                SetParamRobusto(inst, new[] { "CIRCID" }, cidAnc);
+                                SetParamRobusto(inst, new[] { "SWID" }, zidsMap.ContainsKey(cidAnc) ? string.Join(",", zidsMap[cidAnc]) : "");
 
                                 if (tagsParaGrid.Count == 0 || maxLinhaGrupo == maxLinha)
                                 {
@@ -1119,6 +1178,25 @@ namespace Aegia_Automations
                         }
                     }
 
+                    // Se a linha registra o ID estável do circuito (ID_Circ), relê número/tipo VIVOS:
+                    // cobre renumeração de circuitos feita após o lançamento, sem reimportar a memória.
+                    int idcIdx = linha.IndexOf("ID_Circ:");
+                    if (idcIdx != -1)
+                    {
+                        string idcRaw = linha.Substring(idcIdx + "ID_Circ:".Length).Split('|')[0].Trim();
+                        if (long.TryParse(idcRaw, out long circIdVal))
+                        {
+                            Element circEl = doc.GetElement(new ElementId(circIdVal));
+                            if (circEl != null && circEl.IsValidObject)
+                            {
+                                string numVivo = GetParamStringOrValue(circEl, BuiltInParameter.RBS_ELEC_CIRCUIT_NUMBER);
+                                if (!string.IsNullOrEmpty(numVivo)) numCirc = numVivo;
+                                string tipoVivo = GetParamStringOrValueCustom(circEl, "Tipo Circuito");
+                                if (!string.IsNullOrEmpty(tipoVivo)) tipoCirc = tipoVivo;
+                            }
+                        }
+                    }
+
                     linhasValidas.Add(linha);
 
                     if (!dict.ContainsKey(condId)) dict[condId] = new List<CircuitoLog>();
@@ -1272,6 +1350,44 @@ namespace Aegia_Automations
                 index = endVal + 1;
             }
             return d;
+        }
+
+        // Parser estruturado do ZIDS (parâmetro de máquina).
+        // Token rico: "cid:número=label~switchId,label~switchId". Legado: "cid".
+        // Retorna cid -> lista de switchIds (ElementIds dos dispositivos de comando).
+        private Dictionary<string, List<string>> ParseZids(string zids)
+        {
+            var map = new Dictionary<string, List<string>>();
+            if (string.IsNullOrEmpty(zids)) return map;
+
+            foreach (var bloco in zids.Split('|'))
+            {
+                int e = bloco.IndexOf(']');
+                string corpo = e >= 0 ? bloco.Substring(e + 1) : bloco;
+
+                foreach (var tokRaw in corpo.Split(';'))
+                {
+                    string tok = tokRaw.Trim();
+                    if (tok.Length == 0) continue;
+
+                    string cid = tok.Split(':')[0].Trim();
+                    if (cid.Length == 0) continue;
+
+                    if (!map.ContainsKey(cid)) map[cid] = new List<string>();
+
+                    int eq = tok.IndexOf('=');
+                    if (eq >= 0)
+                    {
+                        foreach (var cmd in tok.Substring(eq + 1).Split(','))
+                        {
+                            int tilde = cmd.IndexOf('~');
+                            string swid = tilde >= 0 ? cmd.Substring(tilde + 1).Trim() : "";
+                            if (swid.Length > 0 && !map[cid].Contains(swid)) map[cid].Add(swid);
+                        }
+                    }
+                }
+            }
+            return map;
         }
 
         private Dictionary<string, string> ParseFiacao(string s)
@@ -1428,13 +1544,21 @@ namespace Aegia_Automations
         private WDataGrid dgvMemoria;
         private WComboBox cbDiametro;
         private WButton btnSalvar;
+        private WButton btnAtualizar;
+
+        private AtualizarTagsHandler atualizarHandler;
+        private ExternalEvent atualizarEvent;
 
         public AegiaConfigForm(Document document, SalvarConfigHandler handler, ExternalEvent exEvent)
         {
             this.doc = document;
             this.salvarHandler = handler;
             this.salvarEvent = exEvent;
-            
+
+            // Evento externo próprio para o botão "Atualizar Tags" (UI modeless exige contexto Revit).
+            this.atualizarHandler = new AtualizarTagsHandler();
+            this.atualizarEvent = ExternalEvent.Create(this.atualizarHandler);
+
             MainForm = new WWindow();
             MainForm.Title = "Aegia | Configurador de Tags e Memória";
             MainForm.Width = 650; 
@@ -1695,16 +1819,29 @@ namespace Aegia_Automations
             canvasMemoria.Children.Add(lblMemoriaInfo);
             canvasMemoria.Children.Add(dgvMemoria);
 
-            btnSalvar = new WButton() { 
-                Content = "SALVAR TODAS AS CONFIGURAÇÕES", 
-                Width = 615, Height = 45, 
-                Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(91, 204, 46)), 
-                Foreground = System.Windows.Media.Brushes.White, 
+            btnSalvar = new WButton() {
+                Content = "SALVAR CONFIGURAÇÕES",
+                Width = 360, Height = 45,
+                Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(91, 204, 46)),
+                Foreground = System.Windows.Media.Brushes.White,
                 FontWeight = System.Windows.FontWeights.Bold,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
                 VerticalAlignment = System.Windows.VerticalAlignment.Bottom,
-                Margin = new WThickness(10, 0, 10, 10)
+                Margin = new WThickness(0, 0, 10, 10)
             };
             btnSalvar.Click += BtnSalvar_Click;
+
+            btnAtualizar = new WButton() {
+                Content = "ATUALIZAR TAGS DO PROJETO",
+                Width = 250, Height = 45,
+                Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(33, 118, 188)),
+                Foreground = System.Windows.Media.Brushes.White,
+                FontWeight = System.Windows.FontWeights.Bold,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
+                VerticalAlignment = System.Windows.VerticalAlignment.Bottom,
+                Margin = new WThickness(10, 0, 0, 10)
+            };
+            btnAtualizar.Click += BtnAtualizar_Click;
 
             tabControl.Items.Add(tabTagsFiltros);
             tabControl.Items.Add(tabDiametro);
@@ -1712,6 +1849,7 @@ namespace Aegia_Automations
 
             mainGrid.Children.Add(tabControl);
             mainGrid.Children.Add(btnSalvar);
+            mainGrid.Children.Add(btnAtualizar);
         }
 
         private void PreencherInterfaceFiltrosTags()
@@ -1828,6 +1966,11 @@ namespace Aegia_Automations
         private void BtnSalvar_Click(object sender, System.Windows.RoutedEventArgs e)
         {
             salvarEvent.Raise();
+        }
+
+        private void BtnAtualizar_Click(object sender, System.Windows.RoutedEventArgs e)
+        {
+            atualizarEvent.Raise();
         }
 
         public void ExecutarSalvarRevitContext(Document documentContext)

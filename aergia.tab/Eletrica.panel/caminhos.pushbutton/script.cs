@@ -218,9 +218,12 @@ namespace Aegia_VisualizadorRotas
                     if (s >= 0 && e > s)
                     {
                         string qId = bloco.Substring(s + 1, e - s - 1).Trim();
-                        foreach (var cNum in bloco.Substring(e + 1).Trim().Split(';'))
+                        foreach (var tok in bloco.Substring(e + 1).Trim().Split(';'))
                         {
-                            string chave = $"{qId}_{cNum.Trim()}";
+                            // ZIDS pode ser token rico "cid:número=label~swid,..."; a identidade é o cid antes de ':'.
+                            string cId = tok.Split(':')[0].Trim();
+                            if (string.IsNullOrEmpty(cId)) continue;
+                            string chave = $"{qId}_{cId}";
                             if (!mapaRotas.ContainsKey(chave)) mapaRotas[chave] = new List<ElementId>();
                             mapaRotas[chave].Add(tubo.Id);
                         }

@@ -1,0 +1,18 @@
+title:
+  en_us: Link Models
+  pt_br: Vincular Modelos
+tooltip:
+  en_us: |
+    Link several files at once (RVT, IFC and Navisworks coordination
+    models) choosing the placement method for each one: Origin to
+    Origin, Center to Center, By Shared Coordinates or By Shared Site.
+    IFC is linked through Revit's .rvt cache. Coordination model
+    insertion has limited API support and may open the native dialog.
+  pt_br: |
+    Vincula vários arquivos de uma vez (RVT, IFC e modelos de
+    coordenação Navisworks) escolhendo o método de inserção de cada
+    um: Origem→Origem, Centro→Centro, Coordenadas Compartilhadas ou
+    Por Site Compartilhado. O IFC é vinculado via cache .rvt do Revit.
+    Modelo de coordenação tem suporte limitado na API e pode abrir o
+    diálogo nativo.
+author: "{{author}}"

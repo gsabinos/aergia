@@ -1,0 +1,24 @@
+title:
+  en_us: |-
+    Switch
+    ID
+  pt_br: |-
+    Switch
+    ID
+tooltip:
+  en_us: |
+    Interactive helper to build lighting switch systems. Reads fixtures and
+    switches per room (Room or MEP Space), groups them by circuit and assigns a
+    command letter (A-Z, restarting per circuit; physical order right-to-left,
+    bottom-to-top). Click a command to select/zoom its elements in the model,
+    then hit "Switch System" on the ribbon. Also writes the "Switch ID" param.
+    Shift+click opens settings (tolerances, naming scope, label style).
+  pt_br: |
+    Assistente interativo para criar sistemas de comando. Lê luminárias e
+    interruptores por ambiente (Room ou Espaço MEP), agrupa por circuito e
+    define a letra do comando (A-Z, reinicia por circuito; ordem física
+    direita→esquerda, baixo→cima). Clique num comando para selecionar/zoom os
+    elementos no modelo e clique em "Sistema de comando" na faixa. Também grava
+    o parâmetro "ID do comando". Shift+clique abre a configuração (tolerâncias,
+    escopo de nomeação e estilo do identificador).
+author: "{{author}}"

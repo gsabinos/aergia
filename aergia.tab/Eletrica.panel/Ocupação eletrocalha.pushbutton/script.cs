@@ -153,7 +153,11 @@ namespace Aegia_Automations
             }
             
             string[] arrayIdsLimpos = zidsLimpo.Split(new char[] { ';', '|', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            List<string> idsDosCircuitos = arrayIdsLimpos.Distinct().ToList();
+            // ZIDS pode trazer token rico "cid:número=label~swid,..."; a identidade é o cid antes de ':'.
+            List<string> idsDosCircuitos = arrayIdsLimpos
+                .Select(tok => tok.Split(':')[0].Trim())
+                .Where(s => !string.IsNullOrEmpty(s))
+                .Distinct().ToList();
 
             if (idsDosCircuitos.Count == 0) return;
 

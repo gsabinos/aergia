@@ -1,0 +1,20 @@
+title:
+  en_us: Cut Elements
+  pt_br: Cortar Elementos
+tooltip:
+  en_us: |
+    Cut conduits, cable trays, pipes and ducts into fixed-length segments.
+    Run on the whole project or only on the current selection. Choose
+    "fixed spacing" (cut every X m) or "break max length" (split only
+    elements longer than X). Only straight (linear) elements are cut.
+    Shift+click = cut the conduit and insert a transition box at another
+    elevation, routing the conduit down/up to it (pass-through).
+  pt_br: |
+    Corta eletrodutos, eletrocalhas, tubos e dutos em segmentos de
+    comprimento fixo. Roda no projeto inteiro ou só na seleção atual.
+    Escolha "espaçamento fixo" (corta a cada X m) ou "quebrar distância
+    máxima" (divide só os elementos com mais de X m). Apenas elementos
+    retos (lineares) são cortados.
+    Shift+clique = cortar o eletroduto e inserir uma caixa de transição
+    em outra elevação, descendo/subindo o eletroduto até ela (pass-through).
+author: "{{author}}"

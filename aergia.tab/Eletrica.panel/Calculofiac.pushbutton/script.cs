@@ -264,6 +264,16 @@ namespace Aegia_GestorRotas
 
             NetworkRouter router = new NetworkRouter(doc);
 
+            var cfgCalc = WorksetConfigManager.CarregarConfiguracoesGlobais(Utils.ObterCaminhoConfigLib());
+            bool terraUnico = cfgCalc.TryGetValue("TerraUnicoPorTrecho", out string _tu) && (_tu == "True" || _tu == "true");
+
+            // FCT: temperatura ambiente (default 30 °C) e isolação (PVC default / EPR-XLPE).
+            double tempAmb = 30.0;
+            if (cfgCalc.TryGetValue("TemperaturaAmbiente", out string _ta))
+                double.TryParse(_ta.Replace(",", "."), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out tempAmb);
+            if (tempAmb <= 0) tempAmb = 30.0;
+            bool isEPR = cfgCalc.TryGetValue("IsolacaoTipo", out string _iso) && _iso != null && _iso.ToUpper().Contains("EPR");
+
             using (Transaction t = new Transaction(doc, "Calcular Cabos e Rotas em Lote"))
             {
                 t.Start();
@@ -272,14 +282,23 @@ namespace Aegia_GestorRotas
                     // Limpeza em lote: Varre toda a infraestrutura e limpa os dados dos quadros que serão recalculados
                     LimparInfraestruturaDosQuadros(doc, QuadrosParaCalcular);
 
+                    // Acumulador de ocupação por trecho (compartilhado entre todos os quadros do lote)
+                    var ocupacaoPorTubo = new Dictionary<ElementId, OcupacaoTrecho>();
+
                     foreach (var quadro in QuadrosParaCalcular)
                     {
-                        if (quadro.IsValidObject) ProcessadorQuadro.Processar(doc, quadro, router);
+                        if (quadro.IsValidObject) ProcessadorQuadro.Processar(doc, quadro, router, ocupacaoPorTubo, terraUnico);
                     }
                     doc.Regenerate();
+
+                    int trechosExcedidos = GravarOcupacao(doc, ocupacaoPorTubo);
+                    GravarFatoresCorrecao(doc, ocupacaoPorTubo, tempAmb, isEPR);
                     t.Commit();
-                    
-                    WMessageBox.Show("Cálculo e Roteamento concluídos com sucesso!", "Aegia", WMessageBoxButton.OK, WMessageBoxImage.Information);
+
+                    string msg = "Cálculo e Roteamento concluídos com sucesso!";
+                    if (trechosExcedidos > 0)
+                        msg += $"\n\nATENÇÃO: {trechosExcedidos} trecho(s) acima do limite de ocupação (NBR 5410).";
+                    WMessageBox.Show(msg, "Aegia", WMessageBoxButton.OK, WMessageBoxImage.Information);
                     OnCalculationDone?.Invoke();
                 }
                 catch (Exception ex)
@@ -287,6 +306,73 @@ namespace Aegia_GestorRotas
                     t.RollBack();
                     WMessageBox.Show($"Ocorreu um erro técnico:\n\n{ex.Message}\n{ex.StackTrace}", "Erro na Transação", WMessageBoxButton.OK, WMessageBoxImage.Error);
                 }
+            }
+        }
+
+        // Passe final: converte a área de cabos acumulada por trecho em % de ocupação (NBR 5410)
+        private int GravarOcupacao(Document doc, Dictionary<ElementId, OcupacaoTrecho> ocupacaoPorTubo)
+        {
+            int excedidos = 0;
+            foreach (var kvp in ocupacaoPorTubo)
+            {
+                Element tubo = doc.GetElement(kvp.Key);
+                if (tubo == null || !tubo.IsValidObject || tubo.Category == null) continue;
+
+                OcupacaoTrecho dados = kvp.Value;
+                if (dados.AreaCabosMM2 <= 0) continue;
+
+                long catId = tubo.Category.Id.Value;
+                bool isEletroduto = (catId == (long)BuiltInCategory.OST_Conduit);
+                bool isEletrocalha = (catId == (long)BuiltInCategory.OST_CableTray);
+                if (!isEletroduto && !isEletrocalha) continue;
+
+                double areaInterna = isEletroduto
+                    ? NormaNBR.AreaInternaEletroduto(tubo)
+                    : NormaNBR.AreaInternaEletrocalha(tubo);
+                if (areaInterna <= 0) continue;
+
+                double ocupPct = dados.AreaCabosMM2 / areaInterna * 100.0;
+
+                double limitePct = isEletroduto
+                    ? NormaNBR.LimiteEletroduto(dados.NumCondutores) * 100.0
+                    : NormaNBR.LIM_ELETROCALHA * 100.0;
+
+                bool excedeu = ocupPct > limitePct;
+                if (excedeu) excedidos++;
+
+                Utils.WriteParamNumber(tubo, "ZOCUPACAO", Math.Round(ocupPct, 1));
+                Utils.WriteParam(tubo, "ZOCUPSTATUS", excedeu ? "EXCEDIDO" : "OK");
+            }
+            return excedidos;
+        }
+
+        // Passe final: FCA (Tabela 42) e FCT (Tabela 40) por circuito.
+        // FCA = fator do MAIOR agrupamento (nº de circuitos) entre os eletrodutos que o circuito percorre.
+        // FCT = global, conforme temperatura ambiente e isolação configuradas.
+        private void GravarFatoresCorrecao(Document doc, Dictionary<ElementId, OcupacaoTrecho> ocupacaoPorTubo, double tempAmbienteC, bool isEPR)
+        {
+            // Maior agrupamento experimentado por cada circuito ao longo da sua rota.
+            var maxAgrupPorCirc = new Dictionary<ElementId, int>();
+            foreach (var kvp in ocupacaoPorTubo)
+            {
+                int g = kvp.Value.Circuitos.Count;
+                foreach (var cid in kvp.Value.Circuitos)
+                {
+                    if (!maxAgrupPorCirc.TryGetValue(cid, out int atual) || g > atual)
+                        maxAgrupPorCirc[cid] = g;
+                }
+            }
+
+            double fct = Math.Round(NormaNBR.FatorTemperatura(tempAmbienteC, isEPR), 2);
+
+            foreach (var kvp in maxAgrupPorCirc)
+            {
+                Element circ = doc.GetElement(kvp.Key);
+                if (circ == null || !circ.IsValidObject) continue;
+
+                double fca = Math.Round(NormaNBR.FatorAgrupamento(kvp.Value), 2);
+                Utils.WriteParamNumber(circ, "FCA", fca);
+                Utils.WriteParamNumber(circ, "FCT", fct);
             }
         }
 
@@ -329,6 +415,10 @@ namespace Aegia_GestorRotas
 
                     if (oldCirc != newCirc) Utils.WriteParam(tubo, "ZIDS", newCirc);
                     if (oldTag != newTag) Utils.WriteParam(tubo, "ZFIACAO", newTag);
+
+                    // Zera a ocupação; o passe final regrava para os trechos roteados nesta execução
+                    Utils.ClearParam(tubo, "ZOCUPACAO");
+                    Utils.WriteParam(tubo, "ZOCUPSTATUS", "");
                 }
                 catch (Exception ex) {  }
             }
@@ -338,42 +428,218 @@ namespace Aegia_GestorRotas
         {
             try
             {
+                // Cria/vincula todos os parâmetros customizados do Aegia antes de montar a tabela
+                string relatorio = GarantirParametrosProjeto(doc);
+
                 string nomeTabela = "Aegia - Quantitativo de Fiação e Tubos";
                 var tabelas = new FilteredElementCollector(doc).OfClass(typeof(ViewSchedule)).Cast<ViewSchedule>().ToList();
-                
-                if (!tabelas.Any(x => x.Name == nomeTabela))
+
+                ViewSchedule schedule = tabelas.FirstOrDefault(x => x.Name == nomeTabela);
+                if (schedule == null)
                 {
                     ElementId categoryId = new ElementId((long)BuiltInCategory.OST_Conduit);
-                    ViewSchedule schedule = ViewSchedule.CreateSchedule(doc, categoryId);
+                    schedule = ViewSchedule.CreateSchedule(doc, categoryId);
                     schedule.Name = nomeTabela;
 
-                    var schedulableFields = schedule.Definition.GetSchedulableFields();
-                    
+                    var sf0 = schedule.Definition.GetSchedulableFields();
                     void AddFieldSafely(BuiltInParameter bip)
                     {
-                        var field = schedulableFields.FirstOrDefault(f => f.ParameterId.Value == (long)bip);
+                        var field = sf0.FirstOrDefault(f => f.ParameterId.Value == (long)bip);
                         if (field != null) schedule.Definition.AddField(field);
                     }
-
                     AddFieldSafely(BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM);
                     AddFieldSafely(BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM);
                     AddFieldSafely(BuiltInParameter.CURVE_ELEM_LENGTH);
-
-                    foreach (var field in schedulableFields)
-                    {
-                        string fn = field.GetName(doc);
-                        if (fn == "ZIDS" || fn == "ZFIACAO")
-                        {
-                            schedule.Definition.AddField(field);
-                        }
-                    }
                 }
-                Autodesk.Revit.UI.TaskDialog.Show("Configuração Aegia", "Estrutura base de tabelas do projeto verificada com sucesso!");
+
+                // Garante que os campos Z estejam na tabela (inclui reaparecer após retipagem de parâmetro).
+                var jaNoSchedule = new HashSet<string>();
+                foreach (var fid in schedule.Definition.GetFieldOrder())
+                    jaNoSchedule.Add(schedule.Definition.GetField(fid).GetName());
+                foreach (var field in schedule.Definition.GetSchedulableFields())
+                {
+                    string fn = field.GetName(doc);
+                    if ((fn == "ZIDS" || fn == "ZFIACAO" || fn == "ZOCUPACAO" || fn == "ZOCUPSTATUS") && !jaNoSchedule.Contains(fn))
+                        schedule.Definition.AddField(field);
+                }
+
+                Autodesk.Revit.UI.TaskDialog.Show("Configuração Aegia", "Estrutura base de tabelas e parâmetros verificada.\n\n" + relatorio);
             }
             catch (Exception ex)
             {
                 Autodesk.Revit.UI.TaskDialog.Show("Erro de Configuração", $"Não foi possível criar as tabelas: {ex.Message}");
             }
+        }
+
+        // Conteúdo padrão do arquivo de parâmetros compartilhados Aegia (GUIDs fixos -> consistente
+        // entre projetos/máquinas). Usado para criar o arquivo caso ele não exista / esteja corrompido.
+        private const string SP_CONTEUDO =
+            "# This is a Revit shared parameter file.\r\n" +
+            "# Do not edit manually.\r\n" +
+            "*META\tVERSION\tMINVERSION\r\n" +
+            "META\t2\t1\r\n" +
+            "*GROUP\tID\tNAME\r\n" +
+            "GROUP\t1\tAegia\r\n" +
+            "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE\r\n" +
+            "PARAM\t7e2a0001-0001-4001-8001-000000000001\tZIDS\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0002-0001-4001-8001-000000000002\tZFIACAO\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0011-0001-4001-8001-000000000011\tZOCUPACAO\tNUMBER\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0004-0001-4001-8001-000000000004\tZOCUPSTATUS\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0005-0001-4001-8001-000000000005\tZTIPOFAM\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0006-0001-4001-8001-000000000006\tZIDC\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0007-0001-4001-8001-000000000007\tTipo Circuito\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0012-0001-4001-8001-000000000012\tBitola\tNUMBER\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0009-0001-4001-8001-000000000009\tFASE\tINTEGER\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0013-0001-4001-8001-000000000013\tNEUTRO\tYESNO\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0014-0001-4001-8001-000000000014\tTERRA\tYESNO\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a000c-0001-4001-8001-00000000000c\tComp\tLENGTH\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a000d-0001-4001-8001-00000000000d\tComprimento Fase\tLENGTH\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a000e-0001-4001-8001-00000000000e\tComprimento Neutro\tLENGTH\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a000f-0001-4001-8001-00000000000f\tComprimento Terra\tLENGTH\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0010-0001-4001-8001-000000000010\tComprimento Retorno\tLENGTH\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0015-0001-4001-8001-000000000015\tCIRCID\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0016-0001-4001-8001-000000000016\tSWID\tTEXT\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0017-0001-4001-8001-000000000017\tFCA\tNUMBER\t\t1\t1\t\t1\t0\r\n" +
+            "PARAM\t7e2a0018-0001-4001-8001-000000000018\tFCT\tNUMBER\t\t1\t1\t\t1\t0\r\n";
+
+        // Cria/vincula TODOS os parâmetros customizados do Aegia a partir de um arquivo de
+        // parâmetros compartilhados (GUIDs fixos). Idempotente: pula o que já existe por nome
+        // (não conflita com parâmetros de projeto pré-existentes). Auto-curável: regrava o
+        // arquivo SP se estiver ausente/corrompido. Retorna relatório do que foi feito.
+        private string GarantirParametrosProjeto(Document doc)
+        {
+            Autodesk.Revit.ApplicationServices.Application app = doc.Application;
+
+            var infra4 = new[] { BuiltInCategory.OST_Conduit, BuiltInCategory.OST_ConduitFitting, BuiltInCategory.OST_CableTray, BuiltInCategory.OST_CableTrayFitting };
+            var infraCurvas = new[] { BuiltInCategory.OST_Conduit, BuiltInCategory.OST_CableTray };
+            var fittings = new[] { BuiltInCategory.OST_ConduitFitting, BuiltInCategory.OST_CableTrayFitting };
+            var lum = new[] { BuiltInCategory.OST_LightingFixtures };
+            var circ = new[] { BuiltInCategory.OST_ElectricalCircuit };
+            var anno = new[] { BuiltInCategory.OST_GenericAnnotation };  // tags do SmartTags (CIRCID/SWID)
+
+            var specs = new List<KeyValuePair<string, BuiltInCategory[]>>
+            {
+                new KeyValuePair<string, BuiltInCategory[]>("ZIDS", infra4),
+                new KeyValuePair<string, BuiltInCategory[]>("ZFIACAO", infra4),
+                new KeyValuePair<string, BuiltInCategory[]>("ZOCUPACAO", infraCurvas),
+                new KeyValuePair<string, BuiltInCategory[]>("ZOCUPSTATUS", infraCurvas),
+                new KeyValuePair<string, BuiltInCategory[]>("ZTIPOFAM", fittings),
+                new KeyValuePair<string, BuiltInCategory[]>("ZIDC", lum),
+                new KeyValuePair<string, BuiltInCategory[]>("Tipo Circuito", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("Bitola", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("FASE", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("NEUTRO", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("TERRA", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("Comp", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("Comprimento Fase", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("Comprimento Neutro", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("Comprimento Terra", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("Comprimento Retorno", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("CIRCID", anno),
+                new KeyValuePair<string, BuiltInCategory[]>("SWID", anno),
+                new KeyValuePair<string, BuiltInCategory[]>("FCA", circ),
+                new KeyValuePair<string, BuiltInCategory[]>("FCT", circ),
+            };
+
+            // Snapshot dos parâmetros já vinculados (nome -> definição) para detectar tipo divergente.
+            var bound = new Dictionary<string, Definition>();
+            DefinitionBindingMapIterator it = doc.ParameterBindings.ForwardIterator();
+            it.Reset();
+            while (it.MoveNext())
+            {
+                Definition d = it.Key as Definition;
+                if (d != null) bound[d.Name] = d;
+            }
+
+            // Arquivo SP em local estável. SEMPRE regravado a partir de SP_CONTEUDO para refletir
+            // as definições atuais (evita arquivo "grudado" com tipo antigo, ex.: ZOCUPACAO Texto).
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Aegia");
+            Directory.CreateDirectory(dir);
+            string spPath = Path.Combine(dir, "aegia_parametros.txt");
+            File.WriteAllText(spPath, SP_CONTEUDO);
+
+            string oldSp = app.SharedParametersFilename;
+            var criados = new List<string>();
+            var existiam = new List<string>();
+            var retipados = new List<string>();
+            var falharam = new List<string>();
+            try
+            {
+                app.SharedParametersFilename = spPath;
+                DefinitionFile dfile = app.OpenSharedParameterFile();
+                if (dfile == null)
+                {
+                    File.WriteAllText(spPath, SP_CONTEUDO); // auto-cura
+                    dfile = app.OpenSharedParameterFile();
+                }
+                if (dfile == null)
+                    throw new Exception("Não foi possível abrir o arquivo de parâmetros compartilhados:\n" + spPath);
+
+                foreach (var spec in specs)
+                {
+                    string nome = spec.Key;
+
+                    ExternalDefinition def = null;
+                    foreach (DefinitionGroup g in dfile.Groups)
+                    {
+                        foreach (Definition dd in g.Definitions)
+                            if (dd.Name == nome) { def = dd as ExternalDefinition; break; }
+                        if (def != null) break;
+                    }
+                    if (def == null) { falharam.Add(nome + " (ausente no arquivo SP)"); continue; }
+
+                    // Já vinculado? Mantém se o tipo bate; retipa se diverge (ex.: ZOCUPACAO Texto -> Número).
+                    bool eraRetipagem = false;
+                    if (bound.TryGetValue(nome, out Definition jaDef))
+                    {
+                        bool mesmoTipo = true;
+                        try
+                        {
+                            ForgeTypeId tA = jaDef.GetDataType();
+                            ForgeTypeId tB = def.GetDataType();
+                            mesmoTipo = (tA != null && tB != null && tA.TypeId == tB.TypeId);
+                        }
+                        catch { mesmoTipo = true; }
+
+                        if (mesmoTipo) { existiam.Add(nome); continue; }
+
+                        try { doc.ParameterBindings.Remove(jaDef); eraRetipagem = true; }
+                        catch (Exception ex) { falharam.Add(nome + " (não removeu tipo antigo: " + ex.Message + ")"); continue; }
+                    }
+
+                    CategorySet cats = app.Create.NewCategorySet();
+                    foreach (var bic in spec.Value)
+                    {
+                        Category cat = Category.GetCategory(doc, bic);
+                        if (cat != null) cats.Insert(cat);
+                    }
+                    if (cats.IsEmpty) { falharam.Add(nome + " (categorias indisponíveis)"); continue; }
+
+                    try
+                    {
+                        InstanceBinding binding = app.Create.NewInstanceBinding(cats);
+                        bool ok = doc.ParameterBindings.Insert(def, binding, GroupTypeId.Electrical);
+                        if (!ok) ok = doc.ParameterBindings.ReInsert(def, binding, GroupTypeId.Electrical);
+                        if (ok) { if (eraRetipagem) retipados.Add(nome); else criados.Add(nome); }
+                        else falharam.Add(nome);
+                    }
+                    catch (Exception ex) { falharam.Add(nome + " (" + ex.Message + ")"); }
+                }
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(oldSp)) app.SharedParametersFilename = oldSp;
+            }
+            doc.Regenerate();
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("Arquivo SP: " + spPath);
+            sb.AppendLine();
+            sb.AppendLine($"Criados ({criados.Count}): " + (criados.Count > 0 ? string.Join(", ", criados) : "—"));
+            sb.AppendLine($"Retipados ({retipados.Count}): " + (retipados.Count > 0 ? string.Join(", ", retipados) : "—"));
+            sb.AppendLine($"Já existiam ({existiam.Count}): " + (existiam.Count > 0 ? string.Join(", ", existiam) : "—"));
+            sb.AppendLine($"Falharam ({falharam.Count}): " + (falharam.Count > 0 ? string.Join(", ", falharam) : "—"));
+            return sb.ToString();
         }
 
         private void PrepararVista(Document doc, View view)
@@ -433,9 +699,11 @@ namespace Aegia_GestorRotas
                     if (s >= 0 && e > s)
                     {
                         string qId = bloco.Substring(s + 1, e - s - 1).Trim();
-                        foreach (var cId in bloco.Substring(e + 1).Trim().Split(';'))
+                        foreach (var tok in bloco.Substring(e + 1).Trim().Split(';'))
                         {
-                            string chave = $"{qId}_{cId.Trim()}";
+                            string cId = Utils.CidDeToken(tok);
+                            if (string.IsNullOrEmpty(cId)) continue;
+                            string chave = $"{qId}_{cId}";
                             if (!mapaRotas.ContainsKey(chave)) mapaRotas[chave] = new List<ElementId>();
                             mapaRotas[chave].Add(tubo.Id);
                         }
@@ -1050,24 +1318,61 @@ namespace Aegia_GestorRotas
             WCanvas.SetLeft(lblRegras, 15); WCanvas.SetTop(lblRegras, 120);
 
             dgvWorksets = new WStackPanel() { Width = 460, Background = new WSolidColorBrush(WColors.White) };
-            scrollWorksets = new WScrollViewer() { Width = 480, Height = 310, Content = dgvWorksets, VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto };
+            scrollWorksets = new WScrollViewer() { Width = 480, Height = 270, Content = dgvWorksets, VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto };
             WCanvas.SetLeft(scrollWorksets, 15); WCanvas.SetTop(scrollWorksets, 145);
 
             currentWorksetRows = WorksetConfigManager.PreencherWorksets(docAtivo, dgvWorksets, configSalva);
 
-            WButton btnSalvar = new WButton() { 
-                Content = "SALVAR REGRAS DE ROTEAMENTO", 
-                Width = 480, Height = 40, 
-                Background = new WSolidColorBrush(System.Windows.Media.Color.FromRgb(91, 204, 46)), 
-                Foreground = new WSolidColorBrush(WColors.White), 
-                FontWeight = System.Windows.FontWeights.Bold 
+            WCheckBox chkTerraUnico = new WCheckBox() {
+                Content = "Cabo terra único por trecho (atribuído ao último circuito)",
+                Width = 480, Height = 28,
+                VerticalContentAlignment = System.Windows.VerticalAlignment.Center,
+                IsChecked = configSalva.ContainsKey("TerraUnicoPorTrecho") && configSalva["TerraUnicoPorTrecho"] == "True"
             };
-            WCanvas.SetLeft(btnSalvar, 15); WCanvas.SetTop(btnSalvar, 465);
-            btnSalvar.Click += (s, e) => WorksetConfigManager.SalvarConfiguracoes(currentWorksetRows, configSalva, caminhoArquivoJson);
+            WCanvas.SetLeft(chkTerraUnico, 15); WCanvas.SetTop(chkTerraUnico, 425);
+            chkTerraUnico.Checked += (s, e) => configSalva["TerraUnicoPorTrecho"] = "True";
+            chkTerraUnico.Unchecked += (s, e) => configSalva["TerraUnicoPorTrecho"] = "False";
+
+            // --- Correção de capacidade de condução (NBR 5410): FCT (temperatura + isolação) ---
+            WLabel lblTemp = new WLabel() {
+                Content = "Temperatura ambiente (°C):", Width = 175, Height = 26,
+                VerticalContentAlignment = System.Windows.VerticalAlignment.Center
+            };
+            WCanvas.SetLeft(lblTemp, 15); WCanvas.SetTop(lblTemp, 455);
+
+            WTextBox txtTemp = new WTextBox() {
+                Width = 55, Height = 24,
+                Text = (configSalva.ContainsKey("TemperaturaAmbiente") && !string.IsNullOrWhiteSpace(configSalva["TemperaturaAmbiente"])) ? configSalva["TemperaturaAmbiente"] : "30"
+            };
+            WCanvas.SetLeft(txtTemp, 190); WCanvas.SetTop(txtTemp, 456);
+
+            WCheckBox chkEPR = new WCheckBox() {
+                Content = "Isolação EPR/XLPE (90 °C) — desmarcado = PVC (70 °C)",
+                Width = 480, Height = 26,
+                VerticalContentAlignment = System.Windows.VerticalAlignment.Center,
+                IsChecked = configSalva.ContainsKey("IsolacaoTipo") && configSalva["IsolacaoTipo"] != null && configSalva["IsolacaoTipo"].ToUpper().Contains("EPR")
+            };
+            WCanvas.SetLeft(chkEPR, 15); WCanvas.SetTop(chkEPR, 485);
+
+            WButton btnSalvar = new WButton() {
+                Content = "SALVAR REGRAS DE ROTEAMENTO",
+                Width = 480, Height = 40,
+                Background = new WSolidColorBrush(System.Windows.Media.Color.FromRgb(91, 204, 46)),
+                Foreground = new WSolidColorBrush(WColors.White),
+                FontWeight = System.Windows.FontWeights.Bold
+            };
+            WCanvas.SetLeft(btnSalvar, 15); WCanvas.SetTop(btnSalvar, 520);
+            btnSalvar.Click += (s, e) => {
+                configSalva["TemperaturaAmbiente"] = (txtTemp.Text ?? "30").Trim();
+                configSalva["IsolacaoTipo"] = (chkEPR.IsChecked == true) ? "EPR" : "PVC";
+                WorksetConfigManager.SalvarConfiguracoes(currentWorksetRows, configSalva, caminhoArquivoJson);
+            };
 
             page.Children.Add(lblInjecao); page.Children.Add(lblInjecaoDesc); page.Children.Add(btnInjetar);
             page.Children.Add(linha);
-            page.Children.Add(lblRegras); page.Children.Add(scrollWorksets); page.Children.Add(btnSalvar);
+            page.Children.Add(lblRegras); page.Children.Add(scrollWorksets); page.Children.Add(chkTerraUnico);
+            page.Children.Add(lblTemp); page.Children.Add(txtTemp); page.Children.Add(chkEPR);
+            page.Children.Add(btnSalvar);
         }
     }
 
@@ -1144,6 +1449,8 @@ namespace Aegia_GestorRotas
         public bool Terra { get; set; }
         public HashSet<string> Retornos { get; set; } = new HashSet<string>();
         public HashSet<string> Paralelos { get; set; } = new HashSet<string>();
+        // label do comando -> ElementId do dispositivo de comando (switch). Alimenta o SWID das tags via ZIDS.
+        public Dictionary<string, string> CmdDevice { get; set; } = new Dictionary<string, string>();
     }
 
     public class CircuitoTotais
@@ -1164,6 +1471,12 @@ namespace Aegia_GestorRotas
         private List<Element> allFittings; 
         private Dictionary<string, string> configJson;
         private Dictionary<string, Element> cacheProximidade = new Dictionary<string, Element>();
+
+        // Índice geométrico (lazy) de extremidades de infra, para "ponte" entre juntas não
+        // conectadas por conector Revit. Tolerância ~5 mm.
+        private const double GEO_CELL_FT = 50.0 / 304.8;     // tamanho da célula do índice espacial (~50 mm)
+        private const double GEO_PROJ_TOL_FT = 25.0 / 304.8; // distância máx. para considerar duas infra "tocando" (~25 mm)
+        private Dictionary<string, List<Element>> geoBody;   // célula -> infra cujo corpo passa por ela
 
         public NetworkRouter(Document document)
         {
@@ -1246,6 +1559,123 @@ namespace Aegia_GestorRotas
             return neighbors;
         }
 
+        // Sobe na hierarquia de família ANINHADA (SuperComponent) até achar o nível efetivamente
+        // ligado à infra por conector. Cobre interruptores/luminárias que são componentes aninhados
+        // sem conector próprio — quem carrega a conexão é a família-pai. Retorna null se nenhum nível conecta.
+        public Element ElementoConectavel(Element el)
+        {
+            Element atual = el;
+            int guard = 0;
+            while (atual != null && atual.IsValidObject && guard++ < 8)
+            {
+                if (GetNeighbors(atual).Any(IsInfra)) return atual;
+                Element pai = (atual as FamilyInstance)?.SuperComponent;
+                if (pai == null) break;
+                atual = pai;
+            }
+            return null;
+        }
+
+        // Pontos de conexão de uma infra (origens dos conectores; fallback: extremidades da curva).
+        private List<XYZ> PontosConectores(Element el)
+        {
+            var pts = new List<XYZ>();
+            try
+            {
+                ConnectorManager m = null;
+                if (el is MEPCurve mc) m = mc.ConnectorManager;
+                else if (el is FamilyInstance fi && fi.MEPModel != null) m = fi.MEPModel.ConnectorManager;
+                if (m != null) foreach (Connector c in m.Connectors) pts.Add(c.Origin);
+            }
+            catch { }
+            if (pts.Count == 0 && el.Location is LocationCurve lc && lc.Curve != null)
+            {
+                pts.Add(lc.Curve.GetEndPoint(0));
+                pts.Add(lc.Curve.GetEndPoint(1));
+            }
+            return pts;
+        }
+
+        private string GeoKey(double x, double y, double z) =>
+            $"{(long)Math.Floor(x / GEO_CELL_FT)}_{(long)Math.Floor(y / GEO_CELL_FT)}_{(long)Math.Floor(z / GEO_CELL_FT)}";
+
+        // Índice espacial do CORPO da infra: cada eletroduto/calha é amostrado ao longo da curva e
+        // registrado em todas as células que cruza; fittings entram pela origem dos conectores.
+        // Permite achar infra que "toca" um ponto mesmo no meio do trecho (tap sem conexão Revit).
+        private void EnsureGeoIndex()
+        {
+            if (geoBody != null) return;
+            geoBody = new Dictionary<string, List<Element>>();
+
+            void Add(Element el, double x, double y, double z)
+            {
+                string k = GeoKey(x, y, z);
+                if (!geoBody.TryGetValue(k, out var lst)) { lst = new List<Element>(); geoBody[k] = lst; }
+                if (lst.Count == 0 || lst[lst.Count - 1].Id != el.Id) lst.Add(el);
+            }
+
+            foreach (var el in infraFisica)
+            {
+                if (el == null || !el.IsValidObject) continue;
+                if (el.Location is LocationCurve lc && lc.Curve != null)
+                {
+                    Curve c = lc.Curve;
+                    double len = c.ApproximateLength;
+                    int n = Math.Max(1, (int)Math.Ceiling(len / GEO_CELL_FT));
+                    for (int i = 0; i <= n; i++)
+                    {
+                        try { XYZ p = c.Evaluate((double)i / n, true); Add(el, p.X, p.Y, p.Z); } catch { }
+                    }
+                }
+                else
+                {
+                    foreach (var p in PontosConectores(el)) Add(el, p.X, p.Y, p.Z);
+                }
+            }
+        }
+
+        // Vizinhos GEOMÉTRICOS de uma infra: outras infra cujo corpo passa a <= tol de algum ponto de
+        // conexão desta (cobre extremidades coincidentes E derivações no meio do trecho), mesmo sem
+        // conector Revit. Usa o índice espacial para limitar os candidatos à vizinhança local.
+        public List<Element> GetGeoNeighbors(Element el)
+        {
+            var result = new List<Element>();
+            if (el == null || !el.IsValidObject) return result;
+            EnsureGeoIndex();
+
+            var seen = new HashSet<ElementId> { el.Id };
+            var pts = PontosConectores(el);
+
+            foreach (var p in pts)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dz = -1; dz <= 1; dz++)
+                        {
+                            string k = GeoKey(p.X + dx * GEO_CELL_FT, p.Y + dy * GEO_CELL_FT, p.Z + dz * GEO_CELL_FT);
+                            if (!geoBody.TryGetValue(k, out var lst)) continue;
+
+                            foreach (var other in lst)
+                            {
+                                if (seen.Contains(other.Id)) continue;
+                                double dist;
+                                if (other.Location is LocationCurve olc && olc.Curve != null)
+                                {
+                                    IntersectionResult pr = olc.Curve.Project(p);
+                                    dist = pr != null ? pr.XYZPoint.DistanceTo(p) : double.MaxValue;
+                                }
+                                else if (other.Location is LocationPoint olp)
+                                    dist = olp.Point.DistanceTo(p);
+                                else
+                                    dist = double.MaxValue;
+
+                                if (dist <= GEO_PROJ_TOL_FT && seen.Add(other.Id)) result.Add(other);
+                            }
+                        }
+            }
+            return result;
+        }
+
         public HashSet<ElementId> GetPanelEndpoints(Element panel)
         {
             HashSet<ElementId> ends = new HashSet<ElementId>();
@@ -1322,7 +1752,33 @@ namespace Aegia_GestorRotas
                             return forcedElement;
                         }
                     }
-                } catch (Exception ex) {  } 
+                } catch (Exception ex) {  }
+            }
+
+            // Conectividade real primeiro: se a luminária está fisicamente ligada
+            // (conector Revit) a uma infraestrutura permitida, usa-a diretamente.
+            {
+                XYZ pIns = (luminaria.Location as LocationPoint)?.Point;
+                Element melhorCon = null;
+                double distCon = double.MaxValue;
+                foreach (var n in GetNeighbors(luminaria))
+                {
+                    if (!IsInfra(n) || !IsWsAllowed(n, tipoCirc)) continue;
+                    double d = 0.0;
+                    if (pIns != null)
+                    {
+                        if (n.Location is LocationCurve lc && lc.Curve != null)
+                        { var pr = lc.Curve.Project(pIns); if (pr != null) d = pIns.DistanceTo(pr.XYZPoint); }
+                        else if (n.Location is LocationPoint lp) d = pIns.DistanceTo(lp.Point);
+                    }
+                    if (d < distCon) { distCon = d; melhorCon = n; }
+                }
+                if (melhorCon != null)
+                {
+                    Utils.WriteParam(luminaria, "ZIDC", melhorCon.Id.ToString());
+                    cacheProximidade[cacheKey] = melhorCon;
+                    return melhorCon;
+                }
             }
 
             XYZ ponto = (luminaria.Location as LocationPoint)?.Point;
@@ -1370,8 +1826,15 @@ namespace Aegia_GestorRotas
             }
 
             Element infraOk = infraOkConex ?? infraOkWs;
+
+            // Fallback: nenhuma conexão (fitting) próxima — tenta o eletroduto/eletrocalha mais próximo
+            // (GetClosestInfra varre as CURVAS da infra, não só fittings). Cobre luminárias ligadas
+            // a um eletroduto sem conexão próxima, que antes ficavam sem rota.
+            if (infraOk == null)
+                infraOk = GetClosestInfra(luminaria, tipoCirc);
+
             if (infraOk != null) Utils.WriteParam(luminaria, "ZIDC", infraOk.Id.ToString());
-            
+
             cacheProximidade[cacheKey] = infraOk;
             return infraOk;
         }
@@ -1380,11 +1843,29 @@ namespace Aegia_GestorRotas
         {
             if (startEl == null || endEl == null) return new List<Element>();
 
-            Element start = IsInfra(startEl) ? startEl :
-                ((startEl.Category?.Id.Value == (long)BuiltInCategory.OST_LightingFixtures) ? GetConLumin(startEl, tipoCirc) : GetClosestInfra(startEl, tipoCirc));
+            // Qualquer carga/dispositivo (luminária, INTERRUPTOR, etc.) fisicamente ligado à infra parte
+            // DELE MESMO (ou da família-pai, se for componente aninhado) no BFS, para explorar TODOS os
+            // eletrodutos/calhas conectados — não fica preso num único toco sem saída escolhido por
+            // proximidade. Só sem conexão física cai na âncora por proximidade.
+            Element start;
+            if (IsInfra(startEl)) start = startEl;
+            else
+            {
+                Element conec = ElementoConectavel(startEl);
+                if (conec != null) start = conec;
+                else if (startEl.Category?.Id.Value == (long)BuiltInCategory.OST_LightingFixtures) start = GetConLumin(startEl, tipoCirc);
+                else start = GetClosestInfra(startEl, tipoCirc);
+            }
 
-            Element end = IsInfra(endEl) ? endEl :
-                ((endEl.Category?.Id.Value == (long)BuiltInCategory.OST_LightingFixtures) ? GetConLumin(endEl, tipoCirc) : GetClosestInfra(endEl, tipoCirc));
+            Element end;
+            if (IsInfra(endEl)) end = endEl;
+            else
+            {
+                Element conec = ElementoConectavel(endEl);
+                if (conec != null) end = conec;
+                else if (endEl.Category?.Id.Value == (long)BuiltInCategory.OST_LightingFixtures) end = GetConLumin(endEl, tipoCirc);
+                else end = GetClosestInfra(endEl, tipoCirc);
+            }
 
             if (start == null || end == null) return new List<Element>();
             if (start.Id == end.Id) return new List<Element> { start };
@@ -1393,6 +1874,42 @@ namespace Aegia_GestorRotas
             if (ends.Count == 0) return new List<Element>();
             if (ends.Contains(start.Id)) return new List<Element> { start };
 
+            // Tier 1 (normal): infra + quadros/equipamentos (OST_ElectricalEquipment, sempre)
+            // + luminárias/interruptores que estejam inline na infra (conectados a eletroduto/
+            // eletrocalha ou fitting). Carga ligada só a outras cargas não é atravessada.
+            Func<Element, bool> tier1 = n =>
+            {
+                if (IsInfra(n)) return true;
+                long? c = n?.Category?.Id.Value;
+                if (c == (long)BuiltInCategory.OST_ElectricalEquipment) return true;
+                if (c == (long)BuiltInCategory.OST_LightingFixtures || c == (long)BuiltInCategory.OST_LightingDevices)
+                    return GetNeighbors(n).Any(IsInfra);
+                return false;
+            };
+
+            // Tier 2 (fallback): permite atravessar também tomadas (ElectricalFixtures).
+            Func<Element, bool> tier2 = n =>
+            {
+                if (tier1(n)) return true;
+                long? c = n?.Category?.Id.Value;
+                return c == (long)BuiltInCategory.OST_ElectricalFixtures;
+            };
+
+            var path = BfsToEnds(start, ends, tipoCirc, tier1);
+            if (path.Count == 0) path = BfsToEnds(start, ends, tipoCirc, tier2);
+
+            // Tier 3 (último recurso): há juntas não conectadas por conector Revit (trechos só
+            // "encostados"). Refaz o BFS permitindo ponte geométrica entre infra a cada nó.
+            if (path.Count == 0)
+                path = BfsToEnds(start, ends, tipoCirc, tier2, usarGeo: true);
+
+            return path;
+        }
+
+        // BFS por menos saltos até qualquer endpoint do quadro. 'podeAtravessar' define
+        // quais elementos não-endpoint podem ser nós intermediários da rota.
+        private List<Element> BfsToEnds(Element start, HashSet<ElementId> ends, string tipoCirc, Func<Element, bool> podeAtravessar, bool usarGeo = false)
+        {
             var queue = new System.Collections.Generic.List<Element>();
             HashSet<ElementId> visited = new HashSet<ElementId>();
             Dictionary<ElementId, Element> parentMap = new Dictionary<ElementId, Element>();
@@ -1402,27 +1919,25 @@ namespace Aegia_GestorRotas
             parentMap[start.Id] = null;
 
             Element foundEnd = null;
-
             while (queue.Count > 0)
             {
                 Element node = queue[0]; queue.RemoveAt(0);
+                if (ends.Contains(node.Id)) { foundEnd = node; break; }
 
-                if (ends.Contains(node.Id)) 
+                // Vizinhos por conector Revit + (no modo geo) infra que apenas "encosta" sem conexão.
+                var vizinhos = GetNeighbors(node);
+                if (usarGeo && IsInfra(node)) vizinhos = vizinhos.Concat(GetGeoNeighbors(node)).ToList();
+
+                foreach (Element neighbor in vizinhos)
                 {
-                    foundEnd = node; 
-                    break; 
-                }
+                    if (visited.Contains(neighbor.Id)) continue;
+                    bool isEnd = ends.Contains(neighbor.Id);
+                    if (!isEnd && !podeAtravessar(neighbor)) continue;
+                    if (IsInfra(neighbor) && !IsWsAllowed(neighbor, tipoCirc)) continue;
 
-                foreach (Element neighbor in GetNeighbors(node))
-                {
-                    if (!visited.Contains(neighbor.Id))
-                    {
-                        if (IsInfra(neighbor) && !IsWsAllowed(neighbor, tipoCirc)) continue;
-
-                        visited.Add(neighbor.Id);
-                        parentMap[neighbor.Id] = node;
-                        queue.Add(neighbor);
-                    }
+                    visited.Add(neighbor.Id);
+                    parentMap[neighbor.Id] = node;
+                    queue.Add(neighbor);
                 }
             }
 
@@ -1430,11 +1945,7 @@ namespace Aegia_GestorRotas
             if (foundEnd != null)
             {
                 Element curr = foundEnd;
-                while (curr != null)
-                {
-                    path.Add(curr);
-                    parentMap.TryGetValue(curr.Id, out curr);
-                }
+                while (curr != null) { path.Add(curr); parentMap.TryGetValue(curr.Id, out curr); }
                 path.Reverse();
             }
             return path;
@@ -1443,7 +1954,7 @@ namespace Aegia_GestorRotas
 
     public static class ProcessadorQuadro
     {
-        public static void Processar(Document doc, FamilyInstance quadro, NetworkRouter router)
+        public static void Processar(Document doc, FamilyInstance quadro, NetworkRouter router, Dictionary<ElementId, OcupacaoTrecho> ocupacaoPorTubo = null, bool terraUnicoPorTrecho = false)
         {
             var circuitos = Utils.ObterCircuitosDoQuadro(quadro);
             if (circuitos.Count == 0) return;
@@ -1457,7 +1968,7 @@ namespace Aegia_GestorRotas
 
             foreach (var circ in circuitos) compCircuito[circ.Id] = new CircuitoTotais();
 
-            void RegistrarFio(Element tubo, ElementId circId, string circNum, bool fase = false, bool neutro = false, bool terra = false, string retornoCmd = null, string paraleloCmd = null)
+            void RegistrarFio(Element tubo, ElementId circId, string circNum, bool fase = false, bool neutro = false, bool terra = false, string retornoCmd = null, string paraleloCmd = null, Element cmdDevice = null)
             {
                 if (tubo == null) return;
                 if (!dictInfra.ContainsKey(tubo.Id)) dictInfra[tubo.Id] = new Dictionary<ElementId, FioData>();
@@ -1469,6 +1980,11 @@ namespace Aegia_GestorRotas
                 if (terra) d.Terra = true;
                 if (!string.IsNullOrEmpty(retornoCmd)) d.Retornos.Add(retornoCmd);
                 if (!string.IsNullOrEmpty(paraleloCmd)) d.Paralelos.Add(paraleloCmd);
+
+                // Vincula o label do comando ao ElementId estável do dispositivo de comando (switch).
+                string cmdLabel = retornoCmd ?? paraleloCmd;
+                if (!string.IsNullOrEmpty(cmdLabel) && cmdDevice != null && cmdDevice.IsValidObject)
+                    d.CmdDevice[cmdLabel] = cmdDevice.Id.ToString();
             }
 
             foreach (ElectricalSystem circ in circuitos)
@@ -1524,7 +2040,17 @@ namespace Aegia_GestorRotas
                         var ints = intsByCmd.ContainsKey(cmd) ? intsByCmd[cmd] : new List<Element>();
 
                         if (ints.Count > 0) {
-                            ints = ints.OrderBy(x => router.FindPath(x, quadro, tipoCirc).Count).ToList();
+                            // Ordena pelos interruptores COM rota ao quadro (exclui os sem rota: Count==0 cairia
+                            // em primeiro e tornaria 'intPrincipal' um interruptor sem fase). intPrincipal = o
+                            // paralelo roteável mais próximo do quadro; intFinal = o mais distante (lado da luminária).
+                            var intsComRota = ints
+                                .Select(x => new { sw = x, cnt = router.FindPath(x, quadro, tipoCirc).Count })
+                                .Where(a => a.cnt > 0)
+                                .OrderBy(a => a.cnt)
+                                .Select(a => a.sw)
+                                .ToList();
+                            if (intsComRota.Count > 0) ints = intsComRota;
+
                             var intPrincipal = ints.First();
                             var intFinal = ints.Last();
 
@@ -1534,19 +2060,19 @@ namespace Aegia_GestorRotas
                             if (ints.Count > 1) {
                                 for (int k = 0; k < ints.Count - 1; k++) {
                                     foreach (var e in router.FindPath(ints[k], ints[k + 1], tipoCirc))
-                                        if (router.IsInfra(e)) RegistrarFio(e, circ.Id, nomeCirc, paraleloCmd: cmd);
+                                        if (router.IsInfra(e)) RegistrarFio(e, circ.Id, nomeCirc, paraleloCmd: cmd, cmdDevice: intPrincipal);
                                 }
                             }
 
                             foreach (var lum in lums) {
                                 foreach (var e in router.FindPath(lum, intFinal, tipoCirc))
-                                    if (router.IsInfra(e)) RegistrarFio(e, circ.Id, nomeCirc, retornoCmd: cmd);
+                                    if (router.IsInfra(e)) RegistrarFio(e, circ.Id, nomeCirc, retornoCmd: cmd, cmdDevice: intPrincipal);
                             }
                         }
 
                         foreach (var lum in lums) {
                             foreach (var e in router.FindPath(lum, quadro, tipoCirc))
-                                if (router.IsInfra(e)) 
+                                if (router.IsInfra(e))
                                     RegistrarFio(e, circ.Id, nomeCirc, fase: (ints.Count == 0), neutro: checkN, terra: checkT);
                         }
                     }
@@ -1579,10 +2105,16 @@ namespace Aegia_GestorRotas
 
                 var sortedCids = trechoData.Keys.OrderBy(k => trechoData[k].Num).ToList();
 
+                // Cabo terra único por trecho: o terra fica só no último circuito (maior número) que o pediu.
+                ElementId terraHolderCid = null;
+                if (terraUnicoPorTrecho)
+                    terraHolderCid = sortedCids.Where(k => trechoData[k].Terra)
+                                               .OrderBy(k => Utils.ExtrairNumero(trechoData[k].Num))
+                                               .LastOrDefault();
+
                 foreach (var cid in sortedCids)
                 {
                     var d = trechoData[cid];
-                    cIdsTrecho.Add(cid.ToString());
 
                     ElectricalSystem circObj = doc.GetElement(cid) as ElectricalSystem;
                     int fases = Utils.ReadParamInt(circObj, "FASE"); 
@@ -1596,6 +2128,7 @@ namespace Aegia_GestorRotas
                     int qtdF = d.Fase ? fases : 0;
                     int qtdN = d.Neutro ? 1 : 0;
                     int qtdT = d.Terra ? 1 : 0;
+                    if (terraUnicoPorTrecho) qtdT = (terraHolderCid != null && cid == terraHolderCid) ? 1 : 0;
 
                     var comandosSet = new HashSet<string>(d.Retornos);
                     comandosSet.UnionWith(d.Paralelos);
@@ -1612,10 +2145,20 @@ namespace Aegia_GestorRotas
                         int qtdP = (d.Paralelos.Contains(cmd) ? 2 : 0) * fases;
                         int totalRCmd = qtdR + qtdP;
                         if (totalRCmd > 0) {
-                            partesFio.Add($"{totalRCmd}R({cmd})");
+                            partesFio.Add($"{totalRCmd}R({cmd})");  // ZFIACAO humano: só a letra
                             fiosRTotais += totalRCmd;
                         }
                     }
+
+                    // ZIDS (máquina): token rico cid:número=label~switchId,label~switchId
+                    var swParts = new List<string>();
+                    foreach (string cmd in sortedCmds) {
+                        if (d.CmdDevice.TryGetValue(cmd, out string swid) && !string.IsNullOrEmpty(swid))
+                            swParts.Add($"{Utils.SanitizarToken(cmd)}~{swid}");
+                    }
+                    string richTok = $"{cid}:{Utils.SanitizarToken(d.Num)}";
+                    if (swParts.Count > 0) richTok += "=" + string.Join(",", swParts);
+                    cIdsTrecho.Add(richTok);
 
                     if (partesFio.Count > 0) tagPartsTrecho.Add($"{d.Num}: {string.Join(", ", partesFio)}");
 
@@ -1623,6 +2166,31 @@ namespace Aegia_GestorRotas
                     compCircuito[cid].N += L * qtdN;
                     compCircuito[cid].T += L * qtdT;
                     compCircuito[cid].R += L * fiosRTotais;
+
+                    // Acúmulo de ocupação: área externa dos condutores deste circuito neste trecho
+                    if (ocupacaoPorTubo != null)
+                    {
+                        OcupacaoTrecho acc;
+                        if (!ocupacaoPorTubo.TryGetValue(tuboId, out acc))
+                        {
+                            acc = new OcupacaoTrecho();
+                            ocupacaoPorTubo[tuboId] = acc;
+                        }
+
+                        // Conta o circuito no trecho para o FCA (agrupamento), independente da bitola.
+                        acc.Circuitos.Add(cid);
+
+                        double bitola = NormaNBR.ParseBitola(circObj);
+                        if (bitola > 0)
+                        {
+                            double areaFaseNeutroRet = (qtdF + qtdN + fiosRTotais) * NormaNBR.AreaExternaCaboPVC(bitola);
+                            double areaTerra = qtdT * NormaNBR.AreaExternaCaboPVC(NormaNBR.BitolaTerra(bitola));
+                            int nCondCirc = qtdF + qtdN + qtdT + fiosRTotais;
+
+                            acc.AreaCabosMM2 += areaFaseNeutroRet + areaTerra;
+                            acc.NumCondutores += nCondCirc;
+                        }
+                    }
                 }
 
                 string oldCirc = Utils.LerParametro(tubo, "ZIDS");
@@ -1723,6 +2291,25 @@ namespace Aegia_GestorRotas
             return 0;
         }
 
+        // Remove os delimitadores da gramática do ZIDS (| ; : = , ~ [ ]) de um campo livre
+        // (número de circuito ou label de comando), para não corromper o parser.
+        public static string SanitizarToken(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            foreach (char c in new[] { '|', ';', ':', '=', ',', '~', '[', ']' }) s = s.Replace(c.ToString(), "");
+            return s.Trim();
+        }
+
+        // Parte de identidade (ElementId do circuito) de um token de ZIDS, rico ou legado.
+        // "9876543:12=a~55" -> "9876543";  "9876543" -> "9876543".
+        public static string CidDeToken(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return "";
+            string t = token.Trim();
+            int i = t.IndexOf(':');
+            return (i >= 0 ? t.Substring(0, i) : t).Trim();
+        }
+
         public static string LerParametro(Element el, string nome)
         {
             if (el == null || !el.IsValidObject) return "";
@@ -1753,6 +2340,32 @@ namespace Aegia_GestorRotas
                     }
                     else param.Set(value.ToString());
                 }
+            } catch (Exception ex) {  }
+        }
+
+        // Grava um valor numérico cru (sem conversão de unidade) — para parâmetros tipo Número
+        // como ZOCUPACAO. Se o parâmetro ainda for Texto, grava a representação sem unidade.
+        public static void WriteParamNumber(Element el, string paramName, double value)
+        {
+            try {
+                if (el == null || !el.IsValidObject) return;
+                Parameter param = el.LookupParameter(paramName);
+                if (param == null || param.IsReadOnly) return;
+                if (param.StorageType == StorageType.Double) param.Set(value);
+                else if (param.StorageType == StorageType.Integer) param.Set((int)Math.Round(value));
+                else if (param.StorageType == StorageType.String) param.Set(value.ToString("F1"));
+            } catch (Exception ex) {  }
+        }
+
+        // Limpa o valor de um parâmetro (Texto -> ""; numérico -> sem valor).
+        public static void ClearParam(Element el, string paramName)
+        {
+            try {
+                if (el == null || !el.IsValidObject) return;
+                Parameter param = el.LookupParameter(paramName);
+                if (param == null || param.IsReadOnly) return;
+                if (param.StorageType == StorageType.String) param.Set("");
+                else param.ClearValue();
             } catch (Exception ex) {  }
         }
 
@@ -1828,8 +2441,9 @@ namespace Aegia_GestorRotas
         public static string AddToZids(string zids, string qId, string cIdStr)
         {
             var dict = ParseZids(zids);
-            if (!dict.ContainsKey(qId)) dict[qId] = new HashSet<string>();
-            dict[qId].Add(cIdStr);
+            if (!dict.ContainsKey(qId)) dict[qId] = new Dictionary<string, string>();
+            // Não sobrescreve um token rico (cid:número=...) já existente com um cid puro.
+            if (!dict[qId].ContainsKey(cIdStr)) dict[qId][cIdStr] = cIdStr;
             return BuildZids(dict);
         }
 
@@ -1843,11 +2457,13 @@ namespace Aegia_GestorRotas
             return BuildZids(dict);
         }
 
-        private static Dictionary<string, HashSet<string>> ParseZids(string zids)
+        // qId -> (cid -> token completo). A chave é sempre o cid (identidade estável);
+        // o valor preserva o token rico "cid:número=label~swid,..." quando presente.
+        private static Dictionary<string, Dictionary<string, string>> ParseZids(string zids)
         {
-            var map = new Dictionary<string, HashSet<string>>();
+            var map = new Dictionary<string, Dictionary<string, string>>();
             if (string.IsNullOrWhiteSpace(zids)) return map;
-            
+
             var blocks = zids.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
             foreach (var block in blocks)
             {
@@ -1856,28 +2472,200 @@ namespace Aegia_GestorRotas
                 {
                     string q = block.Substring(s + 1, e - s - 1).Trim();
                     string circsRaw = block.Substring(e + 1);
-                    var circs = circsRaw.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
-                                        .Select(x => x.Trim()).Where(x => !string.IsNullOrEmpty(x));
-                    
-                    if (!map.ContainsKey(q)) map[q] = new HashSet<string>();
-                    foreach (var c in circs) map[q].Add(c);
+                    var tokens = circsRaw.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                                         .Select(x => x.Trim()).Where(x => !string.IsNullOrEmpty(x));
+
+                    if (!map.ContainsKey(q)) map[q] = new Dictionary<string, string>();
+                    foreach (var tok in tokens)
+                    {
+                        string cid = CidDeToken(tok);
+                        if (string.IsNullOrEmpty(cid)) continue;
+                        // Mantém o token mais informativo (rico vence puro) ao deduplicar por cid.
+                        if (!map[q].ContainsKey(cid) || tok.Length > map[q][cid].Length) map[q][cid] = tok;
+                    }
                 }
             }
             return map;
         }
 
-        private static string BuildZids(Dictionary<string, HashSet<string>> map)
+        private static string BuildZids(Dictionary<string, Dictionary<string, string>> map)
         {
             List<string> blocks = new List<string>();
             foreach (var kvp in map)
             {
                 if (kvp.Value.Count > 0)
                 {
-                    var sortedCircs = kvp.Value.OrderBy(x => ExtrairNumero(x)).ToList();
-                    blocks.Add($"[{kvp.Key}] {string.Join(";", sortedCircs)}");
+                    var sortedToks = kvp.Value.Values.OrderBy(t => ExtrairNumero(CidDeToken(t))).ToList();
+                    blocks.Add($"[{kvp.Key}] {string.Join(";", sortedToks)}");
                 }
             }
             return string.Join(" | ", blocks);
+        }
+    }
+
+    // ==========================================
+    // OCUPAÇÃO DE CONDUTOS (NBR 5410)
+    // ==========================================
+    public class OcupacaoTrecho
+    {
+        public double AreaCabosMM2 { get; set; } = 0.0;  // soma da área externa de todos os condutores
+        public int NumCondutores { get; set; } = 0;      // total de condutores físicos no trecho
+        public HashSet<ElementId> Circuitos { get; set; } = new HashSet<ElementId>(); // circuitos distintos no trecho (FCA)
+    }
+
+    public static class NormaNBR
+    {
+        // Limites de ocupação (fração da área interna)
+        public const double LIM_1COND = 0.53;   // 1 condutor
+        public const double LIM_2COND = 0.31;   // 2 condutores
+        public const double LIM_3MAIS = 0.40;   // 3 ou mais condutores
+        public const double LIM_ELETROCALHA = 0.50; // eletrocalha (por área), configurável
+
+        // Tabela bitola (mm²) -> área externa do condutor (mm²) para cabo PVC 450/750V.
+        // Valores de referência NBR 5410 / catálogo de fabricante (área = π/4 · Dext²).
+        private static readonly double[] BitolasTab =
+            { 1.5, 2.5,  4.0,  6.0, 10.0, 16.0, 25.0, 35.0,  50.0,  70.0,  95.0, 120.0, 150.0, 185.0, 240.0 };
+        private static readonly double[] AreaExtTab =
+            { 7.5, 10.2, 13.9, 17.3, 32.2, 41.9, 66.5, 81.7, 109.4, 149.6, 198.6, 243.3, 298.6, 363.1, 471.4 };
+
+        public static double LimiteEletroduto(int numCondutores)
+        {
+            if (numCondutores <= 1) return LIM_1COND;
+            if (numCondutores == 2) return LIM_2COND;
+            return LIM_3MAIS;
+        }
+
+        // FCA - Fator de Correção de Agrupamento (NBR 5410, Tabela 42),
+        // arranjo de circuitos agrupados em eletroduto/canaleta (feixe).
+        public static double FatorAgrupamento(int nCircuitos)
+        {
+            if (nCircuitos <= 1) return 1.00;
+            if (nCircuitos == 2) return 0.80;
+            if (nCircuitos == 3) return 0.70;
+            if (nCircuitos == 4) return 0.65;
+            if (nCircuitos == 5) return 0.60;
+            if (nCircuitos == 6) return 0.57;
+            if (nCircuitos == 7) return 0.54;
+            if (nCircuitos == 8) return 0.52;
+            if (nCircuitos <= 11) return 0.50;   // 9 a 11
+            if (nCircuitos <= 15) return 0.45;   // 12 a 15
+            if (nCircuitos <= 19) return 0.41;   // 16 a 19
+            return 0.38;                          // 20 ou mais
+        }
+
+        // FCT - Fator de Correção de Temperatura (NBR 5410, Tabela 40), temperatura ambiente
+        // de referência 30 °C. Interpolação linear entre os pontos tabelados; isolação PVC (70 °C)
+        // ou EPR/XLPE (90 °C). Fora da faixa, satura no extremo.
+        private static readonly double[] TempTab = { 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80 };
+        private static readonly double[] FctPVC  = { 1.22, 1.17, 1.12, 1.06, 1.00, 0.94, 0.87, 0.79, 0.71, 0.61, 0.50, 0.0, 0.0, 0.0, 0.0 };
+        private static readonly double[] FctEPR  = { 1.15, 1.12, 1.08, 1.04, 1.00, 0.96, 0.91, 0.87, 0.82, 0.76, 0.71, 0.65, 0.58, 0.50, 0.41 };
+
+        public static double FatorTemperatura(double tempAmbienteC, bool isEPR)
+        {
+            double[] f = isEPR ? FctEPR : FctPVC;
+
+            // Determina a faixa útil (PVC tem dados só até 60 °C).
+            int maxIdx = f.Length - 1;
+            while (maxIdx > 0 && f[maxIdx] <= 0.0) maxIdx--;
+
+            if (tempAmbienteC <= TempTab[0]) return f[0];
+            if (tempAmbienteC >= TempTab[maxIdx]) return f[maxIdx];
+
+            for (int i = 0; i < maxIdx; i++)
+            {
+                if (tempAmbienteC >= TempTab[i] && tempAmbienteC <= TempTab[i + 1])
+                {
+                    double t = (tempAmbienteC - TempTab[i]) / (TempTab[i + 1] - TempTab[i]);
+                    return f[i] + t * (f[i + 1] - f[i]);
+                }
+            }
+            return 1.00;
+        }
+
+        // Área externa (mm²) do cabo a partir da bitola: match exato, senão menor faixa >= bitola, senão última.
+        public static double AreaExternaCaboPVC(double bitolaMM2)
+        {
+            if (bitolaMM2 <= 0) return 0.0;
+            for (int i = 0; i < BitolasTab.Length; i++)
+            {
+                if (Math.Abs(BitolasTab[i] - bitolaMM2) < 0.001) return AreaExtTab[i];
+                if (BitolasTab[i] >= bitolaMM2) return AreaExtTab[i];
+            }
+            return AreaExtTab[AreaExtTab.Length - 1];
+        }
+
+        // Seção do condutor de proteção (terra) conforme NBR 5410 (Tabela 6.5):
+        // S<=16 -> S; 16<S<=35 -> 16; S>35 -> S/2.
+        public static double BitolaTerra(double bitolaFase)
+        {
+            if (bitolaFase <= 16.0) return bitolaFase;
+            if (bitolaFase <= 35.0) return 16.0;
+            return bitolaFase / 2.0;
+        }
+
+        // Lê o parâmetro "Bitola" do circuito e extrai a seção em mm² (aceita "2,5", "3#2,5mm²", "1x4").
+        public static double ParseBitola(Element circuito)
+        {
+            // Bitola como Número (mm², sem unidade): lê o valor direto.
+            Parameter pB = circuito?.LookupParameter("Bitola");
+            if (pB != null && pB.HasValue && pB.StorageType == StorageType.Double)
+                return pB.AsDouble();
+
+            // Fallback texto (ex.: "3#2,5mm²", "1x4").
+            string raw = Utils.LerParametro(circuito, "Bitola");
+            if (string.IsNullOrWhiteSpace(raw)) return 0.0;
+
+            // Descarta multiplicadores antes de '#' ou 'x' (ex.: "3#2,5" -> "2,5")
+            int corte = Math.Max(raw.LastIndexOf('#'), Math.Max(raw.LastIndexOf('x'), raw.LastIndexOf('X')));
+            string s = corte >= 0 ? raw.Substring(corte + 1) : raw;
+
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in s)
+            {
+                if (char.IsDigit(c)) sb.Append(c);
+                else if ((c == '.' || c == ',') && sb.Length > 0) sb.Append('.');
+                else if (sb.Length > 0) break;
+            }
+
+            double val;
+            if (double.TryParse(sb.ToString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out val))
+                return val;
+            return 0.0;
+        }
+
+        // Área interna real do eletroduto (mm²): usa o diâmetro interno do tipo se disponível,
+        // senão o diâmetro nominal com fator 0,85 (estimativa para eletroduto rígido).
+        public static double AreaInternaEletroduto(Element conduit)
+        {
+            double dInternoMM = LerDiametroMM(conduit, BuiltInParameter.RBS_CONDUIT_INNER_DIAM_PARAM);
+            if (dInternoMM <= 0)
+            {
+                double dNominalMM = LerDiametroMM(conduit, BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM);
+                if (dNominalMM <= 0) return 0.0;
+                dInternoMM = dNominalMM * 0.85;
+            }
+            return Math.PI * dInternoMM * dInternoMM / 4.0;
+        }
+
+        // Área interna da eletrocalha (mm²) = largura × altura.
+        public static double AreaInternaEletrocalha(Element tray)
+        {
+            double largMM = LerDiametroMM(tray, BuiltInParameter.RBS_CABLETRAY_WIDTH_PARAM);
+            double altMM = LerDiametroMM(tray, BuiltInParameter.RBS_CABLETRAY_HEIGHT_PARAM);
+            if (largMM <= 0 || altMM <= 0) return 0.0;
+            return largMM * altMM;
+        }
+
+        private static double LerDiametroMM(Element el, BuiltInParameter bip)
+        {
+            try
+            {
+                Parameter p = el.get_Parameter(bip);
+                if (p != null && p.HasValue && p.StorageType == StorageType.Double)
+                    return p.AsDouble() * 304.8; // pés -> mm
+            }
+            catch { }
+            return 0.0;
         }
     }
 }
